@@ -1,9 +1,57 @@
 name: CI
 
-on: [push, pull_request]
+on:
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: "Optional Jest test path pattern"
+        required: false
+        default: ""
 
 permissions:
   contents: read
+
+env:
+  # The lockfile pins caniuse-lite 1.0.30001397; browserslist prints an
+  # "outdated caniuse-lite" warning to stderr, which breaks log-asserting tests.
+  BROWSERSLIST_IGNORE_OLD_DATA: "1"
+  # Prints every Jest test reported as skipped or pending, with the upstream gate in
+  # its test file that skipped it (Jest itself only prints a bare skip count).
+  # ES5 on purpose: it also runs on the Node 6/8/10 legs.
+  SEAL_JEST_SKIP_REPORT: |
+    var fs = require("fs"), path = require("path"), file = process.argv[1];
+    if (!fs.existsSync(file)) { console.log("No Jest JSON results at " + file); process.exit(0); }
+    var r = JSON.parse(fs.readFileSync(file, "utf8")), cache = {}, n = 0;
+    var gate = /\b(?:it|test|describe)\.(?:skip|todo)\b|\b(?:it|describe)(?:Babel7\w*|Babel8\w*|Gte|Lt|Satisfies|NoWin32|ESM|NoESM|Negate|Dummy)\b|\bnodeGte\d+\b|\bprocess\.platform\b|\bsemver\.\w+\(|\bBABEL_8_BREAKING\b|\bUSE_ESM\b|\bIS_PUBLISH\b/g;
+    function why(f) {
+      if (cache[f]) return cache[f];
+      var src = "", seen = {}, list = [], m;
+      try { src = fs.readFileSync(f, "utf8"); } catch (e) {}
+      while ((m = gate.exec(src))) if (!seen[m[0]]) { seen[m[0]] = 1; list.push(m[0]); }
+      gate.lastIndex = 0;
+      if (/test-runner|runFixtureTests/.test(src)) list.push("fixture runner: fixture disabled upstream (dot-prefixed fixture dir, or skipWindows/SKIP_* in its options.json)");
+      return (cache[f] = list.length ? list.join(", ") : "skip declared in upstream test source");
+    }
+    // CLI process tests (batch-test-runner) are named "<suite> <test>" after their
+    // test/fixtures/<suite>/<test>/options.json, whose gates decide the skip.
+    function fixtureGate(s, a) {
+      var fn = a.fullName.replace(/^\S+ \[\d+\/\d+\] /, ""), i = s.name.lastIndexOf(path.sep + "test" + path.sep), sp = fn.indexOf(" ");
+      if (i < 0 || sp < 0) return "";
+      var opt = path.join(s.name.slice(0, i), "test", "fixtures", fn.slice(0, sp), fn.slice(sp + 1), "options.json"), o, g = [];
+      try { o = JSON.parse(fs.readFileSync(opt, "utf8")); } catch (e) { return ""; }
+      ["minNodeVersion", "skipWindows", "BABEL_8_BREAKING", "os"].forEach(function (k) { if (k in o) g.push(k + "=" + JSON.stringify(o[k])); });
+      return g.length ? path.relative(process.cwd(), opt) + " sets " + g.join(", ") + " (not satisfied by this Node version / platform / BABEL_8_BREAKING mode)" : "";
+    }
+    console.log("Environment: Node " + process.version + " on " + process.platform + ", BABEL_8_BREAKING=" + (process.env.BABEL_8_BREAKING || "unset") + ", USE_ESM=" + (process.env.USE_ESM || "unset"));
+    r.testResults.forEach(function (s) {
+      (s.assertionResults || []).forEach(function (a) {
+        if (a.status !== "pending" && a.status !== "skipped" && a.status !== "todo") return;
+        n++;
+        var fx = fixtureGate(s, a);
+        console.log("SKIPPED [" + a.status + "] " + path.relative(process.cwd(), s.name) + " > " + a.fullName + "  -- reason: " + (fx ? "fixture gate: " + fx : "upstream conditional skip, gates in this test file: " + why(s.name)));
+      });
+    });
+    console.log("Skipped-test report: " + n + " skipped/todo; totals: " + r.numPassedTests + " passed, " + r.numFailedTests + " failed, " + r.numPendingTests + " pending, " + (r.numTodoTests || 0) + " todo, " + r.numTotalTests + " total");
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -13,13 +61,14 @@ jobs:
   prepare-yarn-cache:
     name: Prepare Cache
     runs-on: ubuntu-latest
+    timeout-minutes: 50
     steps:
       - name: Checkout code
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
       - name: Use Node.js latest
-        uses: actions/setup-node@v3
+        uses: actions/setup-node@v4
         with:
-          node-version: latest
+          node-version: 19
           check-latest: true
           cache: "yarn"
       - name: 'Check or update Yarn cache (fix w/ "yarn install")'
@@ -33,13 +82,14 @@ jobs:
     name: Validate Yarn dependencies and constraints
     needs: prepare-yarn-cache
     runs-on: ubuntu-latest
+    timeout-minutes: 50
     steps:
       - name: Checkout code
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
       - name: Use Node.js latest
-        uses: actions/setup-node@v3
+        uses: actions/setup-node@v4
         with:
-          node-version: latest
+          node-version: 19
           check-latest: true
           cache: "yarn"
       - name: 'Check for unmet constraints (fix w/ "yarn constraints --fix")'
@@ -56,33 +106,40 @@ jobs:
     name: Test on Node.js Latest
     needs: prepare-yarn-cache
     runs-on: ubuntu-latest
+    timeout-minutes: 50
     steps:
       - name: Checkout code
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
       - name: Use Node.js latest
-        uses: actions/setup-node@v3
+        uses: actions/setup-node@v4
         with:
-          node-version: latest
+          node-version: 19
           check-latest: true
           cache: "yarn"
       - name: Generate coverage report
+        # Same commands as `make -j test-ci-coverage`, plus Jest JSON results.
         run: |
-          make -j test-ci-coverage
+          BABEL_ENV=test make -j bootstrap
+          BABEL_ENV=test BABEL_COVERAGE=true yarn c8 jest --maxWorkers=100% --ci --json --outputFile="${{ runner.temp }}/jest-results.json"
+          rm -rf coverage/tmp
           yarn test:esm
-      - name: Upload coverage report
-        uses: codecov/codecov-action@v3
+      - name: List skipped tests with reasons
+        if: always()
+        shell: bash
+        run: node -e "$SEAL_JEST_SKIP_REPORT" "${{ runner.temp }}/jest-results.json"
 
   test-esm:
     name: Test ESM version
     needs: prepare-yarn-cache
     runs-on: ubuntu-latest
+    timeout-minutes: 50
     steps:
       - name: Checkout code
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
       - name: Use Node.js latest
-        uses: actions/setup-node@v3
+        uses: actions/setup-node@v4
         with:
-          node-version: latest
+          node-version: 19
           check-latest: true
           cache: "yarn"
       - name: Use ESM and build
@@ -92,25 +149,32 @@ jobs:
       - name: Test
         # Hack: --color has supports-color@5 returned true for GitHub CI
         # Remove once `chalk` is bumped to 4.0.
-        run: yarn jest --ci --color
+        run: yarn jest --ci --color --json --outputFile="${{ runner.temp }}/jest-results.json" ${{ inputs.test-filter }}
         env:
           BABEL_ENV: test
           USE_ESM: true
+      - name: List skipped tests with reasons
+        if: always()
+        env:
+          USE_ESM: true
+        shell: bash
+        run: node -e "$SEAL_JEST_SKIP_REPORT" "${{ runner.temp }}/jest-results.json"
 
   build:
     name: Build Babel Artifacts
     needs: prepare-yarn-cache
     runs-on: ubuntu-latest
+    timeout-minutes: 50
     # Yarn PnP does not support native ESM yet (https://github.com/yarnpkg/berry/issues/638)
     # env:
     #    YARN_NODE_LINKER: pnp # use pnp linker for better linking performance and stricter checks
     steps:
       - name: Checkout code
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
       - name: Use Node.js latest
-        uses: actions/setup-node@v3
+        uses: actions/setup-node@v4
         with:
-          node-version: latest
+          node-version: 19
           check-latest: true
           cache: "yarn"
       - name: Build babel artifacts
@@ -128,7 +192,7 @@ jobs:
       - name: Prepare artifacts
         run: |
           ./scripts/get-artifact-files.sh | tar --null -cvf babel-artifact.tar --files-from=-
-      - uses: actions/upload-artifact@v3
+      - uses: actions/upload-artifact@v4
         with:
           name: babel-artifact
           path: babel-artifact.tar
@@ -137,16 +201,17 @@ jobs:
   build-windows:
     name: Build Babel Artifacts On Windows
     runs-on: windows-latest
+    timeout-minutes: 50
     # Yarn PnP does not support native ESM yet (https://github.com/yarnpkg/berry/issues/638)
     # env:
     #    YARN_NODE_LINKER: pnp # use pnp linker for better linking performance and stricter checks
     steps:
       - name: Checkout code
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
       - name: Use Node.js latest
-        uses: actions/setup-node@v3
+        uses: actions/setup-node@v4
         with:
-          node-version: latest
+          node-version: 19
           check-latest: true
           cache: "yarn"
       - name: Build babel artifacts
@@ -164,18 +229,19 @@ jobs:
     name: Lint
     needs: build
     runs-on: ubuntu-latest
+    timeout-minutes: 50
     steps:
       - name: Checkout code
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
       - name: Use Node.js latest
-        uses: actions/setup-node@v3
+        uses: actions/setup-node@v4
         with:
-          node-version: latest
+          node-version: 19
           check-latest: true
           cache: "yarn"
       - name: Install
         run: yarn install
-      - uses: actions/download-artifact@v3
+      - uses: actions/download-artifact@v4
         with:
           name: babel-artifact
       - name: Extract artifacts
@@ -190,17 +256,27 @@ jobs:
     name: Test on Node.js # GitHub will add ${{ matrix.node-version }} to this title
     needs: build
     runs-on: ubuntu-latest
+    timeout-minutes: 50
     strategy:
       fail-fast: false
       matrix:
         node-version: [18, 16, 14, 12, 10, 8, 6]
+    env:
+      # The legacy legs re-resolve jest@24 / jest@28 with `yarn up`; resolve
+      # them through the registry time machine at the release date so their
+      # transitive deps still support Node <= 12.
+      YARN_NPM_REGISTRY_SERVER: ${{ (matrix.node-version == '6' || matrix.node-version == '8' || matrix.node-version == '10' || matrix.node-version == '12') && 'https://time-machines-npm.sealsecurity.io/' || 'https://registry.yarnpkg.com' }}
+      YARN_NPM_AUTH_TOKEN: "2023-01-21"
+      YARN_NPM_ALWAYS_AUTH: "true"
+      YARN_CHECKSUM_BEHAVIOR: update
+      YARN_ENABLE_IMMUTABLE_INSTALLS: "false"
     steps:
       - name: Checkout code
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
       - name: Use Node.js latest # Run yarn on latest node
-        uses: actions/setup-node@v3
+        uses: actions/setup-node@v4
         with:
-          node-version: latest
+          node-version: 19
           check-latest: true
           cache: "yarn"
       - name: Install
@@ -221,13 +297,13 @@ jobs:
           # Deduplicate dependencies, because duplicate copies of graceful-fs cause
           # problems with the "path" module: https://github.com/facebook/jest/issues/9656
           yarn dedupe
-      - uses: actions/download-artifact@v3
+      - uses: actions/download-artifact@v4
         with:
           name: babel-artifact
       - name: Extract artifacts
         run: tar -xf babel-artifact.tar; rm babel-artifact.tar
       - name: Use Node.js ${{ matrix.node-version }} # Checkout node version for test executor
-        uses: actions/setup-node@v3
+        uses: actions/setup-node@v4
         with:
           node-version: ${{ matrix.node-version }}
       - name: Test on node.js ${{ matrix.node-version }}
@@ -236,27 +312,32 @@ jobs:
 
         # Todo(Babel 8): Jest execution path is hardcoded because Yarn 2 does not support node 6
         run: |
-          BABEL_ENV=test node --max-old-space-size=4096 ./node_modules/.bin/jest --ci --color
+          BABEL_ENV=test node --max-old-space-size=4096 ./node_modules/.bin/jest --ci --color --json --outputFile="${{ runner.temp }}/jest-results.json" ${{ inputs.test-filter }}
         env:
           TEST_FUZZ: "${{ (matrix.node-version == '6' || matrix.node-version == '8' || matrix.node-version == '10') && 'false' || 'true' }}"
+      - name: List skipped tests with reasons
+        if: always()
+        shell: bash
+        run: node -e "$SEAL_JEST_SKIP_REPORT" "${{ runner.temp }}/jest-results.json"
       - name: Use Node.js latest # For `yarn version` in post actions of the first actions/setup-node
         if: matrix.node-version == '6' || matrix.node-version == '8' || matrix.node-version == '10'
-        uses: actions/setup-node@v3
+        uses: actions/setup-node@v4
         with:
-          node-version: latest
+          node-version: 19
 
   build-babel8:
     name: Build Babel 8 Artifacts for tests
     needs: prepare-yarn-cache
     runs-on: ubuntu-latest
+    timeout-minutes: 50
     # Yarn PnP does not support native ESM yet (https://github.com/yarnpkg/berry/issues/638)
     # env:
     #    YARN_NODE_LINKER: pnp # use pnp linker for better linking performance and stricter checks
     steps:
       - name: Checkout code
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
       - name: Use Node.js 14.17
-        uses: actions/setup-node@v3
+        uses: actions/setup-node@v4
         with:
           node-version: "14.17" # Node.js 14.17 is the first LTS supported by Babel 8
           cache: "yarn"
@@ -274,11 +355,11 @@ jobs:
           BABEL_TYPES_8_BREAKING: true
       - name: Prepare artifacts
         run: |
-          ./scripts/get-artifact-files.sh | tar --null -cvf babel-artifact.tar --files-from=-
-      - uses: actions/upload-artifact@v3
+          ./scripts/get-artifact-files.sh | tar --null -cvf babel8-artifact.tar --files-from=-
+      - uses: actions/upload-artifact@v4
         with:
           name: babel8-artifact
-          path: babel-artifact.tar
+          path: babel8-artifact.tar
           retention-days: 5
 
   test-babel-8-breaking:
@@ -288,51 +369,59 @@ jobs:
       matrix:
         os: [ubuntu-latest, windows-latest]
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 50
     steps:
       - name: Checkout code
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
       - name: Use Node.js 14.17
-        uses: actions/setup-node@v3
+        uses: actions/setup-node@v4
         with:
           node-version: "14.17" # Node.js 14.17 is the first LTS supported by Babel 8
           cache: "yarn"
       - name: Install
         run: |
           yarn install
-      - uses: actions/download-artifact@v3
+      - uses: actions/download-artifact@v4
         with:
           name: babel8-artifact
       - name: Extract artifacts
-        run: tar -xf babel-artifact.tar; rm babel-artifact.tar
+        run: tar -xf babel8-artifact.tar; rm babel8-artifact.tar
       - name: Generate runtime helpers
         run: make build-plugin-transform-runtime-dist
       - name: Test
         # Hack: --color has supports-color@5 returned true for GitHub CI
         # Remove once `chalk` is bumped to 4.0.
         run: |
-          yarn jest --ci --color
+          yarn jest --ci --color --json --outputFile="${{ runner.temp }}/jest-results.json" ${{ inputs.test-filter }}
           yarn test:esm
         env:
           BABEL_ENV: test
           BABEL_8_BREAKING: true
           BABEL_TYPES_8_BREAKING: true
+      - name: List skipped tests with reasons
+        if: always()
+        env:
+          BABEL_8_BREAKING: true
+        shell: bash
+        run: node -e "$SEAL_JEST_SKIP_REPORT" "${{ runner.temp }}/jest-results.json"
 
   test-windows:
     name: Test on Windows
     needs: build
     runs-on: windows-latest
+    timeout-minutes: 50
     steps:
       - name: Checkout code
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
       - name: Use Node.js 18
-        uses: actions/setup-node@v3
+        uses: actions/setup-node@v4
         with:
-          node-version: latest
+          node-version: 19
           check-latest: true
           cache: "yarn"
       - name: Install
         run: yarn install
-      - uses: actions/download-artifact@v3
+      - uses: actions/download-artifact@v4
         with:
           name: babel-artifact
       - name: Extract artifacts
@@ -340,26 +429,31 @@ jobs:
       - name: Test on Windows
         # Hack: --color has supports-color@5 returned true for GitHub CI
         # Remove once `chalk` is bumped to 4.0.
-        run: yarn jest --ci --color
+        run: yarn jest --ci --color --json --outputFile="${{ runner.temp }}/jest-results.json" ${{ inputs.test-filter }}
         env:
           BABEL_ENV: test
+      - name: List skipped tests with reasons
+        if: always()
+        shell: bash
+        run: node -e "$SEAL_JEST_SKIP_REPORT" "${{ runner.temp }}/jest-results.json"
 
   external-parser-tests:
     name: Third-party Parser Tests
     needs: build
     runs-on: ubuntu-latest
+    timeout-minutes: 50
     steps:
       - name: Checkout code
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
       - name: Use Node.js latest
-        uses: actions/setup-node@v3
+        uses: actions/setup-node@v4
         with:
-          node-version: latest
+          node-version: 19
           check-latest: true
           cache: "yarn"
       - name: Install
         run: yarn install
-      - uses: actions/download-artifact@v3
+      - uses: actions/download-artifact@v4
         with:
           name: babel-artifact
       - name: Extract artifacts
@@ -377,13 +471,14 @@ jobs:
     name: Test @babel/runtime integrations
     needs: build
     runs-on: ubuntu-latest
+    timeout-minutes: 50
     steps:
       - name: Checkout code
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
       - name: Use Node.js latest
-        uses: actions/setup-node@v3
+        uses: actions/setup-node@v4
         with:
-          node-version: latest
+          node-version: 19
           check-latest: true
           cache: "yarn"
       # See https://github.com/babel/babel/pull/12906
@@ -407,7 +502,7 @@ jobs:
           # The "Support self-references on old Node.js" step mutates the
           # package.json file, causing a yarn.lock update.
           YARN_ENABLE_IMMUTABLE_INSTALLS: false
-      - uses: actions/download-artifact@v3
+      - uses: actions/download-artifact@v4
         with:
           name: babel-artifact
       - name: Extract artifacts
@@ -419,61 +514,61 @@ jobs:
       - name: Test Node.js latest
         run: node test/runtime-integration/node.cjs
       - name: Use Node.js 10
-        uses: actions/setup-node@v3
+        uses: actions/setup-node@v4
         with:
           node-version: 10
       - name: Test Node.js 10
         run: node test/runtime-integration/node.cjs
       - name: Use Node.js 12.0
-        uses: actions/setup-node@v3
+        uses: actions/setup-node@v4
         with:
           node-version: "12.0" # quoted, otherwise it's just 13
       - name: Test Node.js 12.0
         run: node test/runtime-integration/node.cjs
       - name: Use Node.js 12.17
-        uses: actions/setup-node@v3
+        uses: actions/setup-node@v4
         with:
           node-version: 12.17
       - name: Test Node.js  12.17
         run: node test/runtime-integration/node.cjs
       - name: Use Node.js 13.0
-        uses: actions/setup-node@v3
+        uses: actions/setup-node@v4
         with:
           node-version: "13.0" # quoted, otherwise it's just 13
       - name: Test Node.js 13.0
         run: node test/runtime-integration/node.cjs
       - name: Use Node.js 13.2
-        uses: actions/setup-node@v3
+        uses: actions/setup-node@v4
         with:
           node-version: 13.2
       - name: Test Node.js 13.2
         run: node test/runtime-integration/node.cjs
       - name: Use Node.js 13.6
-        uses: actions/setup-node@v3
+        uses: actions/setup-node@v4
         with:
           node-version: 13.6
       - name: Test Node.js 13.6
         run: node test/runtime-integration/node.cjs
       - name: Use Node.js 13.7
-        uses: actions/setup-node@v3
+        uses: actions/setup-node@v4
         with:
           node-version: 13.7
       - name: Test Node.js 13.7
         run: node test/runtime-integration/node.cjs
       - name: Use Node.js 14.2
-        uses: actions/setup-node@v3
+        uses: actions/setup-node@v4
         with:
           node-version: 14.2
       - name: Test Node.js 14.2
         run: node test/runtime-integration/node.cjs
       - name: Use Node.js 16.5
-        uses: actions/setup-node@v3
+        uses: actions/setup-node@v4
         with:
           node-version: 16.5
       - name: Test Node.js 16.5
         run: node test/runtime-integration/node.cjs
       - name: Use Node.js 16.6
-        uses: actions/setup-node@v3
+        uses: actions/setup-node@v4
         with:
           node-version: 16.6
       - name: Test Node.js 16.6
@@ -483,18 +578,19 @@ jobs:
     name: Test @babel/eslint-* with ESLint 7.5.0
     needs: build
     runs-on: ubuntu-latest
+    timeout-minutes: 50
     steps:
       - name: Checkout code
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
       - name: Use Node.js latest
-        uses: actions/setup-node@v3
+        uses: actions/setup-node@v4
         with:
-          node-version: latest
+          node-version: 19
           check-latest: true
           cache: "yarn"
       - name: Install
         run: yarn install
-      - uses: actions/download-artifact@v3
+      - uses: actions/download-artifact@v4
         with:
           name: babel-artifact
       - name: Extract artifacts
@@ -502,22 +598,27 @@ jobs:
       - name: Downgrade ESLint to 7.5.0
         run: yarn up eslint@7.5.0
       - name: Run babel/eslint tests
-        run: node ./node_modules/.bin/jest eslint
+        run: node ./node_modules/.bin/jest eslint --json --outputFile="${{ runner.temp }}/jest-results.json"
+      - name: List skipped tests with reasons
+        if: always()
+        shell: bash
+        run: node -e "$SEAL_JEST_SKIP_REPORT" "${{ runner.temp }}/jest-results.json"
 
   test262-prepare:
     name: test262 - Prepare for running in parallel
     runs-on: ubuntu-latest
+    timeout-minutes: 50
     if: github.repository == 'babel/babel'
     steps:
       - name: Checkout Babel
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
       - name: Use Node.js latest
-        uses: actions/setup-node@v3
+        uses: actions/setup-node@v4
         with:
-          node-version: latest
+          node-version: 19
           check-latest: true
       - name: Checkout test runner
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
         with:
           repository: babel/babel-test262-runner
           path: babel-test262-runner
@@ -531,7 +632,7 @@ jobs:
         env:
           TEST262_PATH: ../build/test262
       - name: Upload chunks artifact
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: test262-chunks
           path: ~/test262-chunks.json
@@ -543,24 +644,25 @@ jobs:
       matrix:
         chunk: [0, 1, 2, 3, 4, 5, 6, 7]
     runs-on: ubuntu-latest
+    timeout-minutes: 50
     needs: [build, test262-prepare]
     steps:
       - name: Checkout Babel
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
       - name: Use Node.js latest
-        uses: actions/setup-node@v3
+        uses: actions/setup-node@v4
         with:
-          node-version: latest
+          node-version: 19
           check-latest: true
       - name: Install
         run: yarn install
-      - uses: actions/download-artifact@v3
+      - uses: actions/download-artifact@v4
         with:
           name: babel-artifact
       - name: Extract artifacts
         run: tar -xf babel-artifact.tar; rm babel-artifact.tar
       - name: Checkout test runner
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
         with:
           repository: babel/babel-test262-runner
           path: babel-test262-runner
@@ -572,7 +674,7 @@ jobs:
       - name: Download test262
         run: make bootstrap-test262
       - name: Download chunks file
-        uses: actions/download-artifact@v3
+        uses: actions/download-artifact@v4
         with:
           name: test262-chunks
       - name: Run test262
@@ -586,7 +688,7 @@ jobs:
           CHUNKS_FILE: ../test262-chunks.json
           CHUNK: ${{ matrix.chunk }}
       - name: Create artifact with report results
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: test262-result-${{ matrix.chunk }}
           path: ~/test262-${{ matrix.chunk }}.tap
@@ -595,23 +697,24 @@ jobs:
   test262-finish:
     name: test262 - Analyze results
     runs-on: ubuntu-latest
+    timeout-minutes: 50
     needs: test262
     steps:
-      - uses: actions/download-artifact@v3
+      - uses: actions/download-artifact@v4
         with: { name: test262-result-0 }
-      - uses: actions/download-artifact@v3
+      - uses: actions/download-artifact@v4
         with: { name: test262-result-1 }
-      - uses: actions/download-artifact@v3
+      - uses: actions/download-artifact@v4
         with: { name: test262-result-2 }
-      - uses: actions/download-artifact@v3
+      - uses: actions/download-artifact@v4
         with: { name: test262-result-3 }
-      - uses: actions/download-artifact@v3
+      - uses: actions/download-artifact@v4
         with: { name: test262-result-4 }
-      - uses: actions/download-artifact@v3
+      - uses: actions/download-artifact@v4
         with: { name: test262-result-5 }
-      - uses: actions/download-artifact@v3
+      - uses: actions/download-artifact@v4
         with: { name: test262-result-6 }
-      - uses: actions/download-artifact@v3
+      - uses: actions/download-artifact@v4
         with: { name: test262-result-7 }
       - name: Merge chunk results
         run: |
@@ -619,12 +722,12 @@ jobs:
               test262-4.tap test262-5.tap test262-6.tap test262-7.tap \
             | npx tap-merge > test262.tap
       - name: Create artifact with report results
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: test262-result
           path: test262.tap
       - name: Checkout test runner
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
         with:
           repository: babel/babel-test262-runner
           path: babel-test262-runner
@@ -642,3 +745,34 @@ jobs:
         # Specify bash to enable pipefail, so that "| tee" does not suppress the failure exit code.
         # https://docs.github.com/en/actions/using-workflows/workflow-syntax-for-github-actions#jobsjob_idstepsshell
         shell: bash
+
+  pack-npm-artifact:
+    name: Pack npm artifact
+    needs: prepare-yarn-cache
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      - name: Use Node.js 19
+        uses: actions/setup-node@v4
+        with:
+          node-version: 19
+          check-latest: true
+          cache: "yarn"
+      - name: Install
+        run: yarn install
+      - name: Build for publish (as in `make prepublish`)
+        run: |
+          make prepublish-build
+          node ./scripts/set-module-type.js clean
+      - name: Pack
+        run: |
+          mkdir -p seal-artifacts
+          yarn workspace @babel/runtime pack --out "$GITHUB_WORKSPACE/seal-artifacts/runtime-%v.tgz"
+          tar tzvf seal-artifacts/runtime-7.20.13.tgz
+      - uses: actions/upload-artifact@v4
+        with:
+          name: seal-npm-artifact
+          path: seal-artifacts/*.tgz
+          if-no-files-found: error

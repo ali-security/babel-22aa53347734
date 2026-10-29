@@ -33,7 +33,15 @@ function test(name, command, directory, output, first) {
   });
 
   const expectedPath = path.join(__dirname, "expected-bundler.txt");
-  const expected = fs.readFileSync(expectedPath, "utf8");
+  let expected = fs.readFileSync(expectedPath, "utf8");
+  // expected-bundler.txt is generated from the webpack 5 bundle; rollup's
+  // CommonJS interop returns the toPrimitive helper itself, not its namespace.
+  if (directory === "rollup") {
+    expected = expected.replace(
+      /^typeof toPrimitive: object$/m,
+      "typeof toPrimitive: function",
+    );
+  }
 
   if (expected === out) {
     console.log("OK");
@@ -43,5 +51,6 @@ function test(name, command, directory, output, first) {
   } else {
     console.error("FAILED\n");
     console.error(out);
+    process.exitCode = 1;
   }
 }

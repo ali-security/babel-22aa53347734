@@ -409,6 +409,10 @@ describe("@babel/register", function () {
 });
 
 function spawnNodeAsync(args, cwd = dirname, env) {
+  if (env) {
+    // Silence browserslist's stale caniuse-lite warning on stderr.
+    env = Object.assign({ BROWSERSLIST_IGNORE_OLD_DATA: "1" }, env);
+  }
   const spawn = child.spawn(process.execPath, args, { cwd, env });
 
   let output = "";

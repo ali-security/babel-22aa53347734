@@ -54,6 +54,11 @@ function expectError(run) {
         "\n    at ... internal jest frames ...\n    at new Promise (<anonymous>)",
         "",
       );
+      // Node.js <= 10 (trailing async frame, depending on the stack depth)
+      stack = stack.replace(
+        /\n\s*at process\._tickCallback \(\.\.\. internal node frames \.\.\.\)$/g,
+        "",
+      );
       // Node.js 8
       stack = stack.replace(/\n\s*at <anonymous>$/g, "");
       // Node.js 6
